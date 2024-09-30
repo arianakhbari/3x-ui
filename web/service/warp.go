@@ -12,22 +12,40 @@ import (
 
 type WarpService struct {
 	SettingService
+	maxRetries int // Number of retries in case of failure
 }
 
-func (s *WarpService) GetWarpData() (string, error) {
-	warp, err := s.SettingService.GetWarp()
-	if err != nil {
-		return "", err
+// Function to create a custom HTTP client with timeout and connection pooling
+func (s *WarpService) createHttpClient() *http.Client {
+	// Timeout of 10 seconds to handle potential network issues
+	return &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        10, // Keep connections alive for re-use
+			IdleConnTimeout:     30 * time.Second,
+			DisableKeepAlives:   false,
+		},
 	}
-	return warp, nil
 }
 
-func (s *WarpService) DelWarpData() error {
-	err := s.SettingService.SetWarp("")
-	if err != nil {
-		return err
+// Retry mechanism with exponential backoff
+func (s *WarpService) doWithRetry(req *http.Request) (*http.Response, error) {
+	client := s.createHttpClient()
+	var resp *http.Response
+	var err error
+
+	for i := 0; i <= s.maxRetries; i++ {
+		resp, err = client.Do(req)
+		if err == nil {
+			return resp, nil
+		}
+		logger.Debug(fmt.Sprintf("Attempt %d failed: %s. Retrying...", i+1, err.Error()))
+
+		// Exponential backoff
+		time.Sleep(time.Duration((1<<i) * 500) * time.Millisecond)
 	}
-	return nil
+
+	return nil, fmt.Errorf("all retry attempts failed: %v", err)
 }
 
 func (s *WarpService) GetWarpConfig() (string, error) {
@@ -49,12 +67,13 @@ func (s *WarpService) GetWarpConfig() (string, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+warpData["access_token"])
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	// Make the request with retries
+	resp, err := s.doWithRetry(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+
 	buffer := bytes.NewBuffer(make([]byte, 8192))
 	buffer.Reset()
 	_, err = buffer.ReadFrom(resp.Body)
@@ -80,12 +99,13 @@ func (s *WarpService) RegWarp(secretKey string, publicKey string) (string, error
 	req.Header.Add("CF-Client-Version", "a-7.21-0721")
 	req.Header.Add("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	// Make the request with retries
+	resp, err := s.doWithRetry(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+
 	buffer := bytes.NewBuffer(make([]byte, 8192))
 	buffer.Reset()
 	_, err = buffer.ReadFrom(resp.Body)
@@ -137,12 +157,13 @@ func (s *WarpService) SetWarpLicense(license string) (string, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+warpData["access_token"])
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	// Make the request with retries
+	resp, err := s.doWithRetry(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+
 	buffer := bytes.NewBuffer(make([]byte, 8192))
 	buffer.Reset()
 	_, err = buffer.ReadFrom(resp.Body)
