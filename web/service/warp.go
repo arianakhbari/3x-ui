@@ -63,9 +63,13 @@ func (s *WarpService) doWithRetry(req *http.Request) (*http.Response, error) {
 		// Create a new context with timeout for each attempt
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		req = req.WithContext(ctx)
 
-		resp, err = client.Do(req)
+		// Clone the request with the new context
+		reqClone := req.Clone(ctx)
+
+		resp, err = client.Do(reqClone)
+		cancel() // Ensure context is canceled to prevent leaks
+
 		if err == nil && resp.StatusCode < 500 {
 			return resp, nil
 		}
