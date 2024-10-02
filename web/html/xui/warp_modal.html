@@ -5,12 +5,11 @@
         warpData: null,
         warpConfig: null,
         warpOutbound: null,
-        maxRetries: 5,
+        maxRetries: 3,  // Added for retry mechanism
         async show() {
             this.visible = true;
-            if (!this.warpData) {
-                await this.getData();
-            }
+            this.warpConfig = null;
+            await this.getData();  // Ensure data is fetched when showing modal
         },
         close() {
             this.visible = false;
@@ -22,7 +21,7 @@
         async getData() {
             this.loading(true);
             try {
-                const msg = await this.retryRequest(() => HttpUtil.post('/panel/xray/warp/data', {}, { timeout: 5000 }));
+                const msg = await this.retryRequest(() => HttpUtil.post('/panel/xray/warp/data'));
                 if (msg.success) {
                     this.warpData = msg.obj.length > 0 ? JSON.parse(msg.obj) : null;
                 }
@@ -36,7 +35,7 @@
             this.loading(true);
             try {
                 const keys = Wireguard.generateKeypair();
-                const msg = await this.retryRequest(() => HttpUtil.post('/panel/xray/warp/reg', keys, { timeout: 5000 }));
+                const msg = await this.retryRequest(() => HttpUtil.post('/panel/xray/warp/reg', keys));
                 if (msg.success) {
                     const resp = JSON.parse(msg.obj);
                     this.warpData = resp.data;
@@ -52,7 +51,7 @@
         async updateLicense(license) {
             this.loading(true);
             try {
-                const msg = await this.retryRequest(() => HttpUtil.post('/panel/xray/warp/license', { license }, { timeout: 5000 }));
+                const msg = await this.retryRequest(() => HttpUtil.post('/panel/xray/warp/license', { license }));
                 if (msg.success) {
                     this.warpData = JSON.parse(msg.obj);
                     this.warpConfig = null;
@@ -67,7 +66,7 @@
         async getConfig() {
             this.loading(true);
             try {
-                const msg = await this.retryRequest(() => HttpUtil.post('/panel/xray/warp/config', {}, { timeout: 5000 }));
+                const msg = await this.retryRequest(() => HttpUtil.post('/panel/xray/warp/config'));
                 if (msg.success) {
                     this.warpConfig = JSON.parse(msg.obj);
                     this.collectConfig();
@@ -81,7 +80,7 @@
         async delConfig() {
             this.loading(true);
             try {
-                const msg = await this.retryRequest(() => HttpUtil.post('/panel/xray/warp/del', {}, { timeout: 5000 }));
+                const msg = await this.retryRequest(() => HttpUtil.post('/panel/xray/warp/del'));
                 if (msg.success) {
                     this.warpData = null;
                     this.warpConfig = null;
@@ -101,49 +100,52 @@
                 } catch (error) {
                     attempts++;
                     if (attempts >= this.maxRetries) {
-                        console.error(`Request failed after ${this.maxRetries} attempts:`, error);
-                        throw error;
+                        throw error;  // Re-throw error after max attempts
                     }
-                    const backoffTime = Math.min(1000 * Math.pow(2, attempts - 1), 10000);
-                    const jitter = Math.random() * 1000;
-                    await new Promise(res => setTimeout(res, backoffTime + jitter));
+                    await new Promise(res => setTimeout(res, 1000 * attempts));  // Exponential backoff
                 }
             }
         },
         collectConfig() {
-            const config = this.warpConfig.config;
+            const config = warpModal.warpConfig.config;
+            const peer = config.peers[0];
             if (config) {
-                const peer = config.peers[0];
-                this.warpOutbound = Outbound.fromJson({
+                warpModal.warpOutbound = Outbound.fromJson({
                     tag: 'warp',
                     protocol: Protocols.Wireguard,
                     settings: {
-                        mtu: 0, // Set MTU to 0 for automatic detection
-                        secretKey: this.warpData.private_key,
+                        mtu: 1420,
+                        secretKey: warpModal.warpData.private_key,
                         address: this.getAddresses(config.interface.addresses),
                         reserved: this.getResolved(config.client_id),
-                        domainStrategy: 'AsIs', // Adjusted domain strategy
+                        domainStrategy: 'ForceIP',
                         peers: [{
                             publicKey: peer.public_key,
-                            endpoint: `${peer.endpoint.host}:${peer.endpoint.port}`, // Include port
-                            persistentKeepalive: 25 // Added persistent keepalive
+                            endpoint: peer.endpoint.host,
                         }],
-                        kernelMode: true // Enabled kernel mode for performance
+                        kernelMode: false
                     }
                 });
             }
         },
         getAddresses(addrs) {
             let addresses = [];
-            if (addrs.v4) addresses.push(`${addrs.v4}/32`);
-            if (addrs.v6) addresses.push(`${addrs.v6}/128`);
+            if (addrs.v4) addresses.push(addrs.v4 + "/32");
+            if (addrs.v6) addresses.push(addrs.v6 + "/128");
             return addresses;
         },
         getResolved(client_id) {
             let reserved = [];
             let decoded = atob(client_id);
+            let hexString = '';
             for (let i = 0; i < decoded.length; i++) {
-                reserved.push(decoded.charCodeAt(i));
+                let hex = decoded.charCodeAt(i).toString(16);
+                hexString += (hex.length === 1 ? '0' : '') + hex;
+            }
+            for (let i = 0; i < hexString.length; i += 2) {
+                let hexByte = hexString.slice(i, i + 2);
+                let decValue = parseInt(hexByte, 16);
+                reserved.push(decValue);
             }
             return reserved;
         }
@@ -158,16 +160,16 @@
         },
         methods: {
             async register() {
-                await this.warpModal.register();
+                await warpModal.register();
             },
             async updateLicense() {
-                await this.warpModal.updateLicense(this.warpPlus);
+                await warpModal.updateLicense(this.warpPlus);
             },
             async getConfig() {
-                await this.warpModal.getConfig();
+                await warpModal.getConfig();
             },
             async delConfig() {
-                await this.warpModal.delConfig();
+                await warpModal.delConfig();
             }
         },
         computed: {
