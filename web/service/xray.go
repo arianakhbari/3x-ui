@@ -65,7 +65,7 @@ func RemoveIndex(s []interface{}, index int) []interface{} {
     return append(s[:index], s[index+1:]...)
 }
 
-// GetXrayConfig generates the Xray configuration, integrating Warp settings.
+// GetXrayConfig generates the Xray configuration, optimizing for higher throughput.
 func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
     templateConfig, err := s.settingService.GetXrayConfigTemplate()
     if err != nil {
@@ -80,13 +80,40 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
         return nil, err
     }
 
-    // Integrate Warp settings
+    // Optimize global Xray settings for better performance
+    xrayConfig.Transport = &xray.TransportConfig{
+        TCPSettings: &xray.TCPSettings{
+            Header: xray.TCPHeader{
+                Type: "none",
+            },
+            // Enable TCP Fast Open if possible
+            TCPFastOpen: true,
+        },
+        // Increase buffer sizes
+        KCPSettings: &xray.KCPSettings{
+            MTU:             1350,
+            TTI:             20,
+            UpCapacity:      10,
+            DownCapacity:    100,
+            Congestion:      true,
+            ReadBufferSize:  2,
+            WriteBufferSize: 2,
+            Header: xray.KCPHeader{
+                Type: "none",
+            },
+        },
+    }
+
+    // Integrate Warp settings and optimize for performance
     warpConfigStr, err := s.settingService.GetWarp()
     if err == nil && warpConfigStr != "" {
         var warpConfig map[string]interface{}
         err = json.Unmarshal([]byte(warpConfigStr), &warpConfig)
         if err == nil {
-            // Assuming Warp configuration needs to be merged into the Xray config
+            // Optimize Warp settings if necessary
+            warpConfig["mtu"] = 1420
+            warpConfig["concurrency"] = 8 // Increase concurrency for Warp
+
             xrayConfig.OutboundConfigs = append(xrayConfig.OutboundConfigs, xray.OutboundConfig{
                 Protocol: "wireguard",
                 Settings: warpConfig,
@@ -121,6 +148,9 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
             continue
         }
 
+        // Optimize cipher methods for better performance
+        s.optimizeCiphers(settings)
+
         // Handle clients
         clients, ok := settings["clients"].([]interface{})
         if ok {
@@ -135,14 +165,24 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
             inbound.Settings = string(modifiedSettings)
         }
 
-        // Clean up stream settings
-        inbound.StreamSettings = s.cleanStreamSettings(inbound.StreamSettings)
+        // Clean up and optimize stream settings
+        inbound.StreamSettings = s.optimizeStreamSettings(inbound.StreamSettings)
 
         // Generate inbound config
         inboundConfig := inbound.GenXrayInboundConfig()
         xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *inboundConfig)
     }
     return xrayConfig, nil
+}
+
+// optimizeCiphers selects efficient encryption algorithms for better performance.
+func (s *XrayService) optimizeCiphers(settings map[string]interface{}) {
+    if method, ok := settings["method"].(string); ok {
+        // Use AES-128-GCM for better performance
+        if method == "chacha20-poly1305" {
+            settings["method"] = "aes-128-gcm"
+        }
+    }
 }
 
 // filterActiveClients filters out inactive clients and cleans up client configurations.
@@ -187,8 +227,8 @@ func (s *XrayService) filterActiveClients(clients []interface{}, clientStats []C
     return finalClients
 }
 
-// cleanStreamSettings removes unnecessary fields from stream settings.
-func (s *XrayService) cleanStreamSettings(streamSettingsStr string) string {
+// optimizeStreamSettings removes unnecessary fields and optimizes stream settings for performance.
+func (s *XrayService) optimizeStreamSettings(streamSettingsStr string) string {
     if streamSettingsStr == "" {
         return ""
     }
@@ -203,6 +243,9 @@ func (s *XrayService) cleanStreamSettings(streamSettingsStr string) string {
     // Remove settings under tlsSettings and realitySettings
     if tlsSettings, ok := stream["tlsSettings"].(map[string]interface{}); ok {
         delete(tlsSettings, "settings")
+        // Optimize TLS settings
+        tlsSettings["disableSessionResumption"] = false
+        tlsSettings["disableSystemRoot"] = false
     }
     if realitySettings, ok := stream["realitySettings"].(map[string]interface{}); ok {
         delete(realitySettings, "settings")
@@ -211,9 +254,20 @@ func (s *XrayService) cleanStreamSettings(streamSettingsStr string) string {
     // Remove externalProxy field
     delete(stream, "externalProxy")
 
+    // Set network optimization settings
+    stream["sockopt"] = map[string]interface{}{
+        "tcpFastOpen":     true,
+        "tcpKeepAlive":    true,
+        "soReusePort":     true,
+        "soReuseAddr":     true,
+        "tproxy":          "off",
+        "tcpConcurrent":   true,
+        "acceptProxyProtocol": false,
+    }
+
     newStream, err := json.Marshal(stream)
     if err != nil {
-        logger.Error("Failed to marshal cleaned stream settings:", err)
+        logger.Error("Failed to marshal optimized stream settings:", err)
         return streamSettingsStr
     }
 
