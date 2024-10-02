@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -21,24 +22,24 @@ type WarpService struct {
 	httpClient *http.Client
 }
 
-// Initialize httpClient with optimized settings for Iran Irancell network (gRPC and TCP over VLESS)
+// Initialize httpClient with optimized settings for higher upload and download speeds
 func (s *WarpService) getHttpClient() *http.Client {
 	if s.httpClient == nil {
-		// Optimized transport for gRPC and TCP VLESS over high-latency networks (e.g., Iran Irancell)
+		// Optimized transport settings
 		s.httpClient = &http.Client{
-			Timeout: 45 * time.Second, // Increased timeout for long requests (gRPC and TCP)
+			Timeout: 60 * time.Second, // Increased timeout for long requests
 			Transport: &http.Transport{
-				// DialContext handles the TCP connection setup with increased timeouts for slow networks
+				// Custom DialContext with increased timeouts
 				DialContext: (&net.Dialer{
-					Timeout:   45 * time.Second, // Increase timeout for Iran Irancell latency
-					KeepAlive: 45 * time.Second, // Keep connections alive longer for VLESS
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
 				}).DialContext,
-				MaxIdleConns:          150,              // Increase max idle connections for better reuse
-				MaxIdleConnsPerHost:   20,               // Handle more simultaneous connections
-				IdleConnTimeout:       120 * time.Second, // Longer idle timeout for gRPC/VLESS keep-alive
-				TLSHandshakeTimeout:   15 * time.Second,  // Increase TLS handshake timeout for security
-				ExpectContinueTimeout: 2 * time.Second,   // Handle continue expectations for HTTP2/gRPC
-				ForceAttemptHTTP2:     true,              // Enable HTTP2 for better efficiency with gRPC
+				MaxIdleConns:          500,              // Increased max idle connections
+				MaxIdleConnsPerHost:   100,              // Increased per-host connections
+				IdleConnTimeout:       90 * time.Second, // Longer idle timeout
+				TLSHandshakeTimeout:   10 * time.Second, // TLS handshake timeout
+				ExpectContinueTimeout: 1 * time.Second,  // Expect-Continue timeout
+				ForceAttemptHTTP2:     true,             // Enable HTTP/2
 			},
 		}
 	}
@@ -52,15 +53,18 @@ func (s *WarpService) doWithRetry(req *http.Request) (*http.Response, error) {
 	var err error
 
 	if s.maxRetries == 0 {
-		s.maxRetries = 3
+		s.maxRetries = 5 // Increased max retries
 	}
 
-	// Use context with timeout for each request
-	ctx, cancel := context.WithTimeout(req.Context(), 45*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
+	baseBackoff := 500 * time.Millisecond
+	maxBackoff := 10 * time.Second
 
 	for i := 0; i <= s.maxRetries; i++ {
+		// Create a new context with timeout for each attempt
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		req = req.WithContext(ctx)
+
 		resp, err = client.Do(req)
 		if err == nil && resp.StatusCode < 500 {
 			return resp, nil
@@ -68,11 +72,18 @@ func (s *WarpService) doWithRetry(req *http.Request) (*http.Response, error) {
 		if resp != nil {
 			resp.Body.Close()
 		}
-		logger.Debug(fmt.Sprintf("Attempt %d failed: %s. Retrying...", i+1, err))
+		logger.Error(fmt.Sprintf("Attempt %d failed: %v. Retrying...", i+1, err))
 
-		// Exponential backoff with jitter
-		backoff := time.Duration((1<<i)*500 + rand.Intn(500)) * time.Millisecond
-		time.Sleep(backoff)
+		if i < s.maxRetries {
+			// Exponential backoff with jitter
+			sleep := time.Duration(float64(baseBackoff) * math.Pow(2, float64(i)))
+			jitter := time.Duration(rand.Int63n(int64(baseBackoff)))
+			sleep = sleep + jitter
+			if sleep > maxBackoff {
+				sleep = maxBackoff
+			}
+			time.Sleep(sleep)
+		}
 	}
 
 	return nil, fmt.Errorf("all retry attempts failed: %v", err)
@@ -118,12 +129,13 @@ func (s *WarpService) RegWarp(secretKey string, publicKey string) (string, error
 	hostName, _ := os.Hostname()
 
 	// Use a struct and JSON marshalling
-	regData := map[string]string{
-		"key":   publicKey,
-		"tos":   tos,
-		"type":  "PC",
-		"model": "x-ui",
-		"name":  hostName,
+	regData := map[string]interface{}{
+		"key":      publicKey,
+		"tos":      tos,
+		"type":     "PC",
+		"model":    "x-ui",
+		"name":     hostName,
+		"fcm_token": "", // Add empty fcm_token to reduce response size
 	}
 	dataBytes, err := json.Marshal(regData)
 	if err != nil {
