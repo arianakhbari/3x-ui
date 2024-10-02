@@ -13,26 +13,33 @@ import (
 type WarpService struct {
 	SettingService
 	maxRetries int // Number of retries in case of failure
+	httpClient *http.Client
 }
 
-// Function to create a custom HTTP client with timeout and connection pooling
-func (s *WarpService) createHttpClient() *http.Client {
-	// Timeout of 10 seconds to handle potential network issues
-	return &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        10, // Keep connections alive for re-use
-			IdleConnTimeout:     30 * time.Second,
-			DisableKeepAlives:   false,
-		},
+// Initialize httpClient if it's nil
+func (s *WarpService) getHttpClient() *http.Client {
+	if s.httpClient == nil {
+		s.httpClient = &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     30 * time.Second,
+			},
+		}
 	}
+	return s.httpClient
 }
 
 // Retry mechanism with exponential backoff
 func (s *WarpService) doWithRetry(req *http.Request) (*http.Response, error) {
-	client := s.createHttpClient()
+	client := s.getHttpClient()
 	var resp *http.Response
 	var err error
+
+	if s.maxRetries == 0 {
+		s.maxRetries = 3
+	}
 
 	for i := 0; i <= s.maxRetries; i++ {
 		resp, err = client.Do(req)
@@ -42,7 +49,7 @@ func (s *WarpService) doWithRetry(req *http.Request) (*http.Response, error) {
 		logger.Debug(fmt.Sprintf("Attempt %d failed: %s. Retrying...", i+1, err.Error()))
 
 		// Exponential backoff
-		time.Sleep(time.Duration((1<<i) * 500) * time.Millisecond)
+		time.Sleep(time.Duration((1<<i)*500) * time.Millisecond)
 	}
 
 	return nil, fmt.Errorf("all retry attempts failed: %v", err)
@@ -74,8 +81,7 @@ func (s *WarpService) GetWarpConfig() (string, error) {
 	}
 	defer resp.Body.Close()
 
-	buffer := bytes.NewBuffer(make([]byte, 8192))
-	buffer.Reset()
+	var buffer bytes.Buffer
 	_, err = buffer.ReadFrom(resp.Body)
 	if err != nil {
 		return "", err
@@ -106,8 +112,7 @@ func (s *WarpService) RegWarp(secretKey string, publicKey string) (string, error
 	}
 	defer resp.Body.Close()
 
-	buffer := bytes.NewBuffer(make([]byte, 8192))
-	buffer.Reset()
+	var buffer bytes.Buffer
 	_, err = buffer.ReadFrom(resp.Body)
 	if err != nil {
 		return "", err
@@ -119,12 +124,39 @@ func (s *WarpService) RegWarp(secretKey string, publicKey string) (string, error
 		return "", err
 	}
 
-	deviceId := rspData["id"].(string)
-	token := rspData["token"].(string)
-	license, ok := rspData["account"].(map[string]interface{})["license"].(string)
+	deviceIdInterface, ok := rspData["id"]
 	if !ok {
-		logger.Debug("Error accessing license value.")
-		return "", err
+		return "", fmt.Errorf("missing 'id' in response data")
+	}
+	deviceId, ok := deviceIdInterface.(string)
+	if !ok {
+		return "", fmt.Errorf("'id' is not a string")
+	}
+
+	tokenInterface, ok := rspData["token"]
+	if !ok {
+		return "", fmt.Errorf("missing 'token' in response data")
+	}
+	token, ok := tokenInterface.(string)
+	if !ok {
+		return "", fmt.Errorf("'token' is not a string")
+	}
+
+	accountInterface, ok := rspData["account"]
+	if !ok {
+		return "", fmt.Errorf("missing 'account' in response data")
+	}
+	accountMap, ok := accountInterface.(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("'account' is not a map")
+	}
+	licenseInterface, ok := accountMap["license"]
+	if !ok {
+		return "", fmt.Errorf("missing 'license' in account data")
+	}
+	license, ok := licenseInterface.(string)
+	if !ok {
+		return "", fmt.Errorf("'license' is not a string")
 	}
 
 	warpData := fmt.Sprintf("{\n  \"access_token\": \"%s\",\n  \"device_id\": \"%s\",", token, deviceId)
@@ -164,8 +196,7 @@ func (s *WarpService) SetWarpLicense(license string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	buffer := bytes.NewBuffer(make([]byte, 8192))
-	buffer.Reset()
+	var buffer bytes.Buffer
 	_, err = buffer.ReadFrom(resp.Body)
 	if err != nil {
 		return "", err
