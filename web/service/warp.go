@@ -2,8 +2,12 @@ package service
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -19,12 +23,35 @@ type WarpService struct {
 // Initialize httpClient if it's nil
 func (s *WarpService) getHttpClient() *http.Client {
 	if s.httpClient == nil {
+		dnsResolver := &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{
+					Timeout: 10 * time.Second,
+				}
+				// Use a reliable DNS server
+				return d.DialContext(ctx, "udp", "1.1.1.1:53") // Cloudflare DNS
+			},
+		}
+
+		dialer := &net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Resolver:  dnsResolver,
+		}
+
 		s.httpClient = &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: 60 * time.Second, // Increased timeout
 			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     30 * time.Second,
+				DialContext:         dialer.DialContext,
+				MaxIdleConns:        200,              // Increased for better performance
+				MaxIdleConnsPerHost: 100,              // Increased per-host connections
+				IdleConnTimeout:     90 * time.Second, // Increased idle timeout
+				TLSHandshakeTimeout: 15 * time.Second, // Increased TLS handshake timeout
+				ForceAttemptHTTP2:   true,             // Enable HTTP/2
+				TLSClientConfig: &tls.Config{
+					MinVersion: tls.VersionTLS12,
+				},
 			},
 		}
 	}
@@ -38,18 +65,31 @@ func (s *WarpService) doWithRetry(req *http.Request) (*http.Response, error) {
 	var err error
 
 	if s.maxRetries == 0 {
-		s.maxRetries = 3
+		s.maxRetries = 5 // Increased retries
 	}
 
 	for i := 0; i <= s.maxRetries; i++ {
+		// Create a context with timeout for each request
+		ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+		defer cancel()
+
+		req = req.WithContext(ctx)
+
+		startTime := time.Now()
 		resp, err = client.Do(req)
+		duration := time.Since(startTime)
+
 		if err == nil {
+			logger.Info(fmt.Sprintf("Request succeeded in %v ms", duration.Milliseconds()))
 			return resp, nil
 		}
-		logger.Debug(fmt.Sprintf("Attempt %d failed: %s. Retrying...", i+1, err.Error()))
 
-		// Exponential backoff
-		time.Sleep(time.Duration((1<<i)*500) * time.Millisecond)
+		logger.Error(fmt.Sprintf("Attempt %d failed after %v ms: %s. Retrying...", i+1, duration.Milliseconds(), err.Error()))
+
+		// Exponential backoff with jitter
+		backoff := time.Duration((1<<i)*500) * time.Millisecond
+		jitter := time.Duration(rand.Int63n(int64(backoff / 2)))
+		time.Sleep(backoff + jitter)
 	}
 
 	return nil, fmt.Errorf("all retry attempts failed: %v", err)
@@ -81,6 +121,7 @@ func (s *WarpService) GetWarpConfig() (string, error) {
 	}
 	defer resp.Body.Close()
 
+	// Optionally decompress the response if compressed
 	var buffer bytes.Buffer
 	_, err = buffer.ReadFrom(resp.Body)
 	if err != nil {
@@ -104,6 +145,8 @@ func (s *WarpService) RegWarp(secretKey string, publicKey string) (string, error
 
 	req.Header.Add("CF-Client-Version", "a-7.21-0721")
 	req.Header.Add("Content-Type", "application/json")
+	// Request compressed response
+	req.Header.Add("Accept-Encoding", "gzip")
 
 	// Make the request with retries
 	resp, err := s.doWithRetry(req)
@@ -112,51 +155,45 @@ func (s *WarpService) RegWarp(secretKey string, publicKey string) (string, error
 	}
 	defer resp.Body.Close()
 
-	var buffer bytes.Buffer
-	_, err = buffer.ReadFrom(resp.Body)
-	if err != nil {
-		return "", err
+	// Handle compressed response
+	var reader *bytes.Buffer
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		reader, err = decompressGZIP(resp.Body)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		reader = new(bytes.Buffer)
+		_, err = reader.ReadFrom(resp.Body)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	var rspData map[string]interface{}
-	err = json.Unmarshal(buffer.Bytes(), &rspData)
+	err = json.Unmarshal(reader.Bytes(), &rspData)
 	if err != nil {
 		return "", err
 	}
 
-	deviceIdInterface, ok := rspData["id"]
+	deviceId, ok := rspData["id"].(string)
 	if !ok {
-		return "", fmt.Errorf("missing 'id' in response data")
-	}
-	deviceId, ok := deviceIdInterface.(string)
-	if !ok {
-		return "", fmt.Errorf("'id' is not a string")
+		return "", fmt.Errorf("missing or invalid 'id' in response data")
 	}
 
-	tokenInterface, ok := rspData["token"]
+	token, ok := rspData["token"].(string)
 	if !ok {
-		return "", fmt.Errorf("missing 'token' in response data")
-	}
-	token, ok := tokenInterface.(string)
-	if !ok {
-		return "", fmt.Errorf("'token' is not a string")
+		return "", fmt.Errorf("missing or invalid 'token' in response data")
 	}
 
-	accountInterface, ok := rspData["account"]
+	accountMap, ok := rspData["account"].(map[string]interface{})
 	if !ok {
-		return "", fmt.Errorf("missing 'account' in response data")
+		return "", fmt.Errorf("missing or invalid 'account' in response data")
 	}
-	accountMap, ok := accountInterface.(map[string]interface{})
+
+	license, ok := accountMap["license"].(string)
 	if !ok {
-		return "", fmt.Errorf("'account' is not a map")
-	}
-	licenseInterface, ok := accountMap["license"]
-	if !ok {
-		return "", fmt.Errorf("missing 'license' in account data")
-	}
-	license, ok := licenseInterface.(string)
-	if !ok {
-		return "", fmt.Errorf("'license' is not a string")
+		return "", fmt.Errorf("missing or invalid 'license' in account data")
 	}
 
 	warpData := fmt.Sprintf("{\n  \"access_token\": \"%s\",\n  \"device_id\": \"%s\",", token, deviceId)
@@ -164,7 +201,7 @@ func (s *WarpService) RegWarp(secretKey string, publicKey string) (string, error
 
 	s.SettingService.SetWarp(warpData)
 
-	result := fmt.Sprintf("{\n  \"data\": %s,\n  \"config\": %s\n}", warpData, buffer.String())
+	result := fmt.Sprintf("{\n  \"data\": %s,\n  \"config\": %s\n}", warpData, reader.String())
 
 	return result, nil
 }
@@ -188,6 +225,8 @@ func (s *WarpService) SetWarpLicense(license string) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+warpData["access_token"])
+	// Request compressed response
+	req.Header.Add("Accept-Encoding", "gzip")
 
 	// Make the request with retries
 	resp, err := s.doWithRetry(req)
@@ -196,10 +235,19 @@ func (s *WarpService) SetWarpLicense(license string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	var buffer bytes.Buffer
-	_, err = buffer.ReadFrom(resp.Body)
-	if err != nil {
-		return "", err
+	// Handle compressed response
+	var reader *bytes.Buffer
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		reader, err = decompressGZIP(resp.Body)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		reader = new(bytes.Buffer)
+		_, err = reader.ReadFrom(resp.Body)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	warpData["license_key"] = license
@@ -208,7 +256,24 @@ func (s *WarpService) SetWarpLicense(license string) (string, error) {
 		return "", err
 	}
 	s.SettingService.SetWarp(string(newWarpData))
-	println(string(newWarpData))
+	fmt.Println(string(newWarpData))
 
 	return string(newWarpData), nil
+}
+
+// Helper function to decompress GZIP responses
+func decompressGZIP(body io.Reader) (*bytes.Buffer, error) {
+	gzipReader, err := gzip.NewReader(body)
+	if err != nil {
+		return nil, err
+	}
+	defer gzipReader.Close()
+
+	var buffer bytes.Buffer
+	_, err = buffer.ReadFrom(gzipReader)
+	if err != nil {
+		return nil, err
+	}
+
+	return &buffer, nil
 }
