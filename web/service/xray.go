@@ -1,268 +1,274 @@
-package warp
-
 import (
-	"bytes"
-	"context"
 	"encoding/json"
-	"fmt"
-	"io/ioutil"
-	"math"
-	"math/rand"
-	"net"
-	"net/http"
-	"os"
+	"errors"
+	"sync"
 	"time"
+
 	"x-ui/logger"
+	"x-ui/xray"
+
+	"go.uber.org/atomic"
 )
 
-// WarpService struct with improved structuring
-type WarpService struct {
-	SettingService
-	maxRetries int // Number of retries in case of failure
-	httpClient *http.Client
+var (
+	p                 *xray.Process
+	lock              sync.Mutex
+	isNeedXrayRestart atomic.Bool
+	result            string
+)
+
+type XrayService struct {
+	inboundService InboundService
+	settingService SettingService
+	xrayAPI        xray.XrayAPI
+	// Add a channel to signal process termination
+	stopChan chan struct{}
 }
 
-// Initialize httpClient with optimized settings for higher upload and download speeds
-func (s *WarpService) getHttpClient() *http.Client {
-	if s.httpClient == nil {
-		// Optimized transport settings
-		s.httpClient = &http.Client{
-			Timeout: 60 * time.Second, // Increased timeout for long requests
-			Transport: &http.Transport{
-				// Custom DialContext with increased timeouts
-				DialContext: (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				MaxIdleConns:          500,              // Increased max idle connections
-				MaxIdleConnsPerHost:   100,              // Increased per-host connections
-				IdleConnTimeout:       90 * time.Second, // Longer idle timeout
-				TLSHandshakeTimeout:   10 * time.Second, // TLS handshake timeout
-				ExpectContinueTimeout: 1 * time.Second,  // Expect-Continue timeout
-				ForceAttemptHTTP2:     true,             // Enable HTTP/2
-			},
-		}
+// Initialize the stop channel when creating a new XrayService
+func NewXrayService(inboundService InboundService, settingService SettingService, xrayAPI xray.XrayAPI) *XrayService {
+	return &XrayService{
+		inboundService: inboundService,
+		settingService: settingService,
+		xrayAPI:        xrayAPI,
+		stopChan:       make(chan struct{}),
 	}
-	return s.httpClient
 }
 
-// Retry mechanism with exponential backoff and jitter
-func (s *WarpService) doWithRetry(req *http.Request) (*http.Response, error) {
-	client := s.getHttpClient()
-	var resp *http.Response
-	var err error
+func (s *XrayService) IsXrayRunning() bool {
+	return p != nil && p.IsRunning()
+}
 
-	if s.maxRetries == 0 {
-		s.maxRetries = 5 // Increased max retries
+func (s *XrayService) GetXrayErr() error {
+	if p == nil {
+		return nil
+	}
+	return p.GetErr()
+}
+
+func (s *XrayService) GetXrayResult() string {
+	if result != "" {
+		return result
+	}
+	if s.IsXrayRunning() {
+		return ""
+	}
+	if p == nil {
+		return ""
+	}
+	result = p.GetResult()
+	return result
+}
+
+func (s *XrayService) GetXrayVersion() string {
+	if p == nil {
+		return "Unknown"
+	}
+	return p.GetVersion()
+}
+
+func RemoveIndex(s []interface{}, index int) []interface{} {
+	return append(s[:index], s[index+1:]...)
+}
+
+func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
+	templateConfig, err := s.settingService.GetXrayConfigTemplate()
+	if err != nil {
+		return nil, err
 	}
 
-	baseBackoff := 500 * time.Millisecond
-	maxBackoff := 10 * time.Second
+	xrayConfig := &xray.Config{}
+	err = json.Unmarshal([]byte(templateConfig), xrayConfig)
+	if err != nil {
+		return nil, err
+	}
 
-	for i := 0; i <= s.maxRetries; i++ {
-		// Create a new context with timeout for each attempt
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		req = req.WithContext(ctx)
+	// Removed redundant call to AddTraffic
+	// s.inboundService.AddTraffic(nil, nil)
 
-		resp, err = client.Do(req)
-		if err == nil && resp.StatusCode < 500 {
-			return resp, nil
+	inbounds, err := s.inboundService.GetAllInbounds()
+	if err != nil {
+		return nil, err
+	}
+	for _, inbound := range inbounds {
+		if !inbound.Enable {
+			continue
 		}
-		if resp != nil {
-			resp.Body.Close()
+		// get settings clients
+		settings := map[string]interface{}{}
+		err := json.Unmarshal([]byte(inbound.Settings), &settings)
+		if err != nil {
+			logger.Errorf("Failed to unmarshal inbound settings: %v", err)
+			continue
 		}
-		logger.Error(fmt.Sprintf("Attempt %d failed: %v. Retrying...", i+1, err))
-
-		if i < s.maxRetries {
-			// Exponential backoff with jitter
-			sleep := time.Duration(float64(baseBackoff) * math.Pow(2, float64(i)))
-			jitter := time.Duration(rand.Int63n(int64(baseBackoff)))
-			sleep = sleep + jitter
-			if sleep > maxBackoff {
-				sleep = maxBackoff
+		clients, ok := settings["clients"].([]interface{})
+		if ok {
+			// check users active or not
+			clientStats := inbound.ClientStats
+			indexDecrease := 0 // Moved outside the loop
+			for _, clientTraffic := range clientStats {
+				for index, client := range clients {
+					c := client.(map[string]interface{})
+					if c["email"] == clientTraffic.Email {
+						if !clientTraffic.Enable {
+							clients = RemoveIndex(clients, index-indexDecrease)
+							indexDecrease++
+							logger.Infof("Remove Inbound User %s due to expiration or traffic limit", c["email"])
+						}
+					}
+				}
 			}
-			time.Sleep(sleep)
+
+			// clear client config for additional parameters
+			var final_clients []interface{}
+			for _, client := range clients {
+				c := client.(map[string]interface{})
+				if c["enable"] != nil {
+					if enable, ok := c["enable"].(bool); ok && !enable {
+						continue
+					}
+				}
+				// Retain necessary keys and remove others
+				for key := range c {
+					if key != "email" && key != "id" && key != "password" && key != "flow" && key != "method" {
+						delete(c, key)
+					}
+				}
+				if c["flow"] == "xtls-rprx-vision-udp443" {
+					c["flow"] = "xtls-rprx-vision"
+				}
+				final_clients = append(final_clients, interface{}(c))
+			}
+
+			settings["clients"] = final_clients
+			modifiedSettings, err := json.MarshalIndent(settings, "", "  ")
+			if err != nil {
+				return nil, err
+			}
+
+			inbound.Settings = string(modifiedSettings)
+		}
+
+		if len(inbound.StreamSettings) > 0 {
+			// Unmarshal stream JSON
+			var stream map[string]interface{}
+			err := json.Unmarshal([]byte(inbound.StreamSettings), &stream)
+			if err != nil {
+				logger.Errorf("Failed to unmarshal stream settings: %v", err)
+				continue
+			}
+
+			// Remove the "settings" field under "tlsSettings" and "realitySettings"
+			if tlsSettings, ok := stream["tlsSettings"].(map[string]interface{}); ok {
+				delete(tlsSettings, "settings")
+			}
+			if realitySettings, ok := stream["realitySettings"].(map[string]interface{}); ok {
+				delete(realitySettings, "settings")
+			}
+
+			delete(stream, "externalProxy")
+
+			newStream, err := json.MarshalIndent(stream, "", "  ")
+			if err != nil {
+				return nil, err
+			}
+			inbound.StreamSettings = string(newStream)
+		}
+
+		inboundConfig := inbound.GenXrayInboundConfig()
+		xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *inboundConfig)
+	}
+	return xrayConfig, nil
+}
+
+func (s *XrayService) GetXrayTraffic() ([]*xray.Traffic, []*xray.ClientTraffic, error) {
+	if !s.IsXrayRunning() {
+		err := errors.New("xray is not running")
+		logger.Debug("Attempted to fetch Xray traffic, but Xray is not running:", err)
+		return nil, nil, err
+	}
+	apiPort := p.GetAPIPort()
+	s.xrayAPI.Init(apiPort)
+	// Removed defer s.xrayAPI.Close() to prevent premature closure
+
+	traffic, clientTraffic, err := s.xrayAPI.GetTraffic(true)
+	if err != nil {
+		logger.Debug("Failed to fetch Xray traffic:", err)
+		return nil, nil, err
+	}
+	return traffic, clientTraffic, nil
+}
+
+// Added a monitor function to restart Xray on unexpected termination
+func (s *XrayService) monitorXrayProcess() {
+	for {
+		select {
+		case <-s.stopChan:
+			logger.Debug("Xray process monitor stopped.")
+			return
+		default:
+			if !s.IsXrayRunning() {
+				logger.Warn("Xray process has stopped unexpectedly. Restarting...")
+				err := s.RestartXray(true)
+				if err != nil {
+					logger.Errorf("Failed to restart Xray: %v", err)
+				}
+			}
+			time.Sleep(5 * time.Second) // Adjust the interval as needed
+		}
+	}
+}
+
+func (s *XrayService) RestartXray(isForce bool) error {
+	lock.Lock()
+	defer lock.Unlock()
+	logger.Debug("Restarting Xray, force:", isForce)
+
+	xrayConfig, err := s.GetXrayConfig()
+	if err != nil {
+		return err
+	}
+
+	if s.IsXrayRunning() {
+		if !isForce && p.GetConfig().Equals(xrayConfig) {
+			logger.Debug("No need to restart Xray; configuration unchanged.")
+			return nil
+		}
+		err := p.Stop()
+		if err != nil {
+			logger.Errorf("Error stopping Xray: %v", err)
 		}
 	}
 
-	return nil, fmt.Errorf("all retry attempts failed: %v", err)
+	p = xray.NewProcess(xrayConfig)
+	result = ""
+	err = p.Start()
+	if err != nil {
+		logger.Errorf("Error starting Xray: %v", err)
+		return err
+	}
+
+	// Start the monitor in a separate goroutine
+	go s.monitorXrayProcess()
+
+	return nil
 }
 
-func (s *WarpService) GetWarpConfig() (string, error) {
-	var warpData map[string]string
-	warp, err := s.SettingService.GetWarp()
-	if err != nil {
-		return "", err
+func (s *XrayService) StopXray() error {
+	lock.Lock()
+	defer lock.Unlock()
+	logger.Debug("Attempting to stop Xray...")
+	if s.IsXrayRunning() {
+		close(s.stopChan) // Signal the monitor to stop
+		return p.Stop()
 	}
-	err = json.Unmarshal([]byte(warp), &warpData)
-	if err != nil {
-		return "", err
-	}
-
-	url := fmt.Sprintf("https://api.cloudflareclient.com/v0a2158/reg/%s", warpData["device_id"])
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+warpData["access_token"])
-
-	// Make the request with retries
-	resp, err := s.doWithRetry(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	// Read response body efficiently
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	return string(body), nil
+	return errors.New("xray is not running")
 }
 
-func (s *WarpService) RegWarp(secretKey string, publicKey string) (string, error) {
-	tos := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
-	hostName, _ := os.Hostname()
-
-	// Use a struct and JSON marshalling
-	regData := map[string]interface{}{
-		"key":      publicKey,
-		"tos":      tos,
-		"type":     "PC",
-		"model":    "x-ui",
-		"name":     hostName,
-		"fcm_token": "", // Add empty fcm_token to reduce response size
-	}
-	dataBytes, err := json.Marshal(regData)
-	if err != nil {
-		return "", err
-	}
-
-	url := "https://api.cloudflareclient.com/v0a2158/reg"
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(dataBytes))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Add("CF-Client-Version", "a-7.21-0721")
-	req.Header.Add("Content-Type", "application/json")
-
-	// Make the request with retries
-	resp, err := s.doWithRetry(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	// Read response body efficiently
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var rspData map[string]interface{}
-	err = json.Unmarshal(body, &rspData)
-	if err != nil {
-		return "", err
-	}
-
-	deviceId, ok := rspData["id"].(string)
-	if !ok {
-		return "", fmt.Errorf("missing or invalid 'id' in response data")
-	}
-
-	token, ok := rspData["token"].(string)
-	if !ok {
-		return "", fmt.Errorf("missing or invalid 'token' in response data")
-	}
-
-	accountMap, ok := rspData["account"].(map[string]interface{})
-	if !ok {
-		return "", fmt.Errorf("missing or invalid 'account' in response data")
-	}
-	license, ok := accountMap["license"].(string)
-	if !ok {
-		return "", fmt.Errorf("missing or invalid 'license' in account data")
-	}
-
-	warpData := map[string]string{
-		"access_token": token,
-		"device_id":    deviceId,
-		"license_key":  license,
-		"private_key":  secretKey,
-	}
-	warpDataBytes, err := json.MarshalIndent(warpData, "", "  ")
-	if err != nil {
-		return "", err
-	}
-
-	err = s.SettingService.SetWarp(string(warpDataBytes))
-	if err != nil {
-		return "", err
-	}
-
-	result := fmt.Sprintf("{\n  \"data\": %s,\n  \"config\": %s\n}", string(warpDataBytes), string(body))
-
-	return result, nil
+func (s *XrayService) SetToNeedRestart() {
+	isNeedXrayRestart.Store(true)
 }
 
-func (s *WarpService) SetWarpLicense(license string) (string, error) {
-	var warpData map[string]string
-	warp, err := s.SettingService.GetWarp()
-	if err != nil {
-		return "", err
-	}
-	err = json.Unmarshal([]byte(warp), &warpData)
-	if err != nil {
-		return "", err
-	}
-
-	url := fmt.Sprintf("https://api.cloudflareclient.com/v0a2158/reg/%s/account", warpData["device_id"])
-
-	// Use a struct and JSON marshalling
-	licenseData := map[string]string{
-		"license": license,
-	}
-	dataBytes, err := json.Marshal(licenseData)
-	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(dataBytes))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+warpData["access_token"])
-	req.Header.Set("Content-Type", "application/json")
-
-	// Make the request with retries
-	resp, err := s.doWithRetry(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	// Read response body efficiently
-	_, err = ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	warpData["license_key"] = license
-	newWarpData, err := json.MarshalIndent(warpData, "", "  ")
-	if err != nil {
-		return "", err
-	}
-
-	err = s.SettingService.SetWarp(string(newWarpData))
-	if err != nil {
-		return "", err
-	}
-
-	return string(newWarpData), nil
+func (s *XrayService) IsNeedRestartAndSetFalse() bool {
+	return isNeedXrayRestart.CompareAndSwap(true, false)
 }
